@@ -1,0 +1,87 @@
+#!/bin/bash -e
+
+# TEMPORARY: rebuilds OpenResty on a patched nginx core and installs the nginx
+# binary and the geoip2 dynamic module into /out, to be copied over the ones in
+# the base image. Remove this script, bump-openresty-nginx.sh and the
+# "openresty" stage in docker/Dockerfile once nginxproxymanager/nginx-full
+# ships an OpenResty release with the nginx security fixes.
+#
+# Configure flags mirror docker-nginx-full's build-openresty.sh so that the
+# binary is a drop-in replacement for the base image's one.
+
+CYAN='\E[1;36m'
+YELLOW='\E[1;33m'
+BLUE='\E[1;34m'
+GREEN='\E[1;32m'
+RESET='\E[0m'
+
+: "${OPENRESTY_VERSION:?}" "${OPENRESTY_SHA256:?}" "${NGINX_VERSION:?}" "${NGINX_SHA256:?}" "${GEOIP2_COMMIT:?}"
+
+echo -e "${BLUE}❯ ${CYAN}Building OpenResty ${YELLOW}${OPENRESTY_VERSION}${CYAN} on nginx ${YELLOW}${NGINX_VERSION}${CYAN}...${RESET}"
+
+cd /tmp
+wget -q "https://github.com/openresty/openresty/archive/refs/tags/v${OPENRESTY_VERSION}.tar.gz" -O openresty.tar.gz
+echo "${OPENRESTY_SHA256}  openresty.tar.gz" | sha256sum -c -
+tar -xzf openresty.tar.gz
+mv "/tmp/openresty-${OPENRESTY_VERSION}" /tmp/openresty
+
+git clone -q https://github.com/leev/ngx_http_geoip2_module.git /tmp/openresty/ngx_http_geoip2_module
+git -C /tmp/openresty/ngx_http_geoip2_module checkout -q "${GEOIP2_COMMIT}"
+
+/tmp/bump-openresty-nginx.sh /tmp/openresty "${NGINX_VERSION}" "${NGINX_SHA256}"
+
+cd /tmp/openresty
+make
+cd "openresty-$(./util/ver)"
+
+./configure \
+	--prefix=/etc/nginx \
+	--sbin-path=/usr/sbin/nginx \
+	--modules-path=/usr/lib/nginx/modules \
+	--conf-path=/etc/nginx/nginx.conf \
+	--error-log-path=/var/log/nginx/error.log \
+	--http-log-path=/var/log/nginx/access.log \
+	--pid-path=/var/run/nginx.pid \
+	--lock-path=/var/run/nginx.lock \
+	--http-client-body-temp-path=/var/cache/nginx/client_temp \
+	--http-proxy-temp-path=/var/cache/nginx/proxy_temp \
+	--http-fastcgi-temp-path=/var/cache/nginx/fastcgi_temp \
+	--http-uwsgi-temp-path=/var/cache/nginx/uwsgi_temp \
+	--http-scgi-temp-path=/var/cache/nginx/scgi_temp \
+	--user=nginx \
+	--group=nginx \
+	--with-compat \
+	--with-threads \
+	--with-http_addition_module \
+	--with-http_auth_request_module \
+	--with-http_dav_module \
+	--with-http_flv_module \
+	--with-http_gunzip_module \
+	--with-http_gzip_static_module \
+	--with-http_mp4_module \
+	--with-http_random_index_module \
+	--with-http_realip_module \
+	--with-http_secure_link_module \
+	--with-http_slice_module \
+	--with-http_ssl_module \
+	--with-http_stub_status_module \
+	--with-http_sub_module \
+	--with-http_v2_module \
+	--with-mail \
+	--with-mail_ssl_module \
+	--with-stream \
+	--with-stream_realip_module \
+	--with-stream_ssl_module \
+	--with-stream_ssl_preread_module \
+	--with-http_v3_module \
+	--add-dynamic-module=/tmp/openresty/ngx_http_geoip2_module
+
+make -j"$(nproc)"
+
+# Only the nginx binary and the dynamic module change. LuaJIT, lualib and the
+# rest of the OpenResty tree are the same versions as in the base image.
+mkdir -p /out/usr/sbin /out/usr/lib/nginx/modules
+install -m 755 build/nginx-*/objs/nginx /out/usr/sbin/nginx
+install -m 644 build/nginx-*/objs/ngx_http_geoip2_module.so /out/usr/lib/nginx/modules/
+
+echo -e "${BLUE}❯ ${GREEN}OpenResty build completed${RESET}"
