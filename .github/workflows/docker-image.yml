@@ -1,0 +1,164 @@
+name: Docker image
+
+# Builds the Nginx Proxy Manager image for amd64 and arm64 on native runners
+# and publishes it to ghcr.io/<owner>/nginx-proxy-manager.
+#
+# The image builds on nginxproxymanager/nginx-full:certbot-node; docker/Dockerfile
+# currently replaces its nginx binary with one built on a patched nginx core.
+# Pull requests are built for amd64 only, without pushing.
+
+on:
+  push:
+    branches: [develop]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      base_image:
+        description: "Base image (default: nginxproxymanager/nginx-full:certbot-node)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    runs-on: ubuntu-24.04
+    outputs:
+      base_image: ${{ steps.vars.outputs.base_image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve base image
+        id: vars
+        env:
+          INPUT_BASE: ${{ inputs.base_image }}
+        run: |
+          base="${INPUT_BASE:-nginxproxymanager/nginx-full:certbot-node}"
+          echo "base_image=$base" >> "$GITHUB_OUTPUT"
+
+      - name: Build frontend
+        env:
+          BASE_IMAGE: ${{ steps.vars.outputs.base_image }}
+        run: |
+          docker run --rm \
+            -e CI=true \
+            -e NODE_OPTIONS=--openssl-legacy-provider \
+            -v "$PWD/frontend:/app/frontend" \
+            -w /app/frontend "$BASE_IMAGE" \
+            sh -c "yarn install && yarn lint && yarn locale-compile && yarn vitest run --no-color && yarn build && chown -R $(id -u):$(id -g) /app/frontend"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          retention-days: 1
+
+  build:
+    needs: frontend
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Skip arm64 on pull requests
+        id: skip
+        run: echo "skip=${{ github.event_name == 'pull_request' && matrix.arch == 'arm64' }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.skip.outputs.skip != 'true'
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: steps.skip.outputs.skip != 'true'
+        with:
+          name: frontend-dist
+          path: frontend/dist
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        if: steps.skip.outputs.skip != 'true'
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        if: steps.skip.outputs.skip != 'true' && github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build${{ github.event_name != 'pull_request' && ' and push' || '' }}
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          ARCH: ${{ matrix.arch }}
+          BASE_IMAGE: ${{ needs.frontend.outputs.base_image }}
+          PUSH: ${{ github.event_name != 'pull_request' }}
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/nginx-proxy-manager"
+          TAG="${IMAGE}:${GITHUB_SHA::7}-${ARCH}"
+          OUTPUT="--load"
+          [ "$PUSH" = "true" ] && OUTPUT="--push"
+          docker buildx build \
+            --platform "linux/${ARCH}" \
+            --build-arg BASE_IMAGE="$BASE_IMAGE" \
+            --build-arg BUILD_VERSION="$(cat .version)" \
+            --build-arg BUILD_COMMIT="${GITHUB_SHA::7}" \
+            --build-arg BUILD_DATE="$(date '+%Y-%m-%d %T %Z')" \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --cache-from "type=gha,scope=npm-${ARCH}" \
+            --cache-to "type=gha,mode=max,scope=npm-${ARCH}" \
+            --pull --progress plain \
+            -f docker/Dockerfile -t "$TAG" $OUTPUT .
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Smoke test
+        if: steps.skip.outputs.skip != 'true'
+        run: |
+          docker run --rm --entrypoint nginx "$TAG" -V
+          docker run -d --name npm -p 8181:81 -v /data -v /etc/letsencrypt "$TAG"
+          for _ in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:8181/api/ | grep -q '"status":"OK"'; then
+              echo "API is up"; docker rm -f npm; exit 0
+            fi
+            sleep 2
+          done
+          docker logs --tail 100 npm
+          exit 1
+
+  merge:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/nginx-proxy-manager"
+          SHA="${GITHUB_SHA::7}"
+          docker buildx imagetools create \
+            -t "${IMAGE}:latest" \
+            -t "${IMAGE}:$(cat .version)" \
+            -t "${IMAGE}:sha-${SHA}" \
+            "${IMAGE}:${SHA}-amd64" "${IMAGE}:${SHA}-arm64"
+          docker buildx imagetools inspect "${IMAGE}:latest"

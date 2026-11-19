@@ -87,6 +87,23 @@ Sometimes this can take a little bit because of the entropy of keys.
 
 [http://127.0.0.1:81](http://127.0.0.1:81)
 
+## Patched image (temporary)
+
+OpenResty 1.31.8.1, used by the upstream base image, bundles nginx 1.31.8. That
+version is affected by the November 2026 nginx security issues (CVE-2026-123007,
+CVE-2026-123633, CVE-2026-121810, CVE-2026-113425, CVE-2026-123634 and more),
+which nginx fixed in 1.31.9. Until the base image ships a fixed OpenResty
+release, this fork's `docker/Dockerfile` rebuilds OpenResty on nginx 1.31.9 and
+replaces the base image's nginx binary with it.
+
+`.github/workflows/docker-image.yml` publishes the image for amd64 and arm64:
+
+```yml
+    image: 'ghcr.io/arumes31/nginx-proxy-manager:latest'
+```
+
+This workaround will be removed once upstream is patched.
+
 
 ## Contributing
 

@@ -5,6 +5,28 @@
 
 ARG BASE_IMAGE=nginxproxymanager/nginx-full:certbot-node
 FROM nginxproxymanager/testca AS testca
+
+# TEMPORARY: OpenResty 1.31.8.1 in the base image bundles nginx 1.31.8, which is
+# affected by CVE-2026-123007, CVE-2026-123633, CVE-2026-121810, CVE-2026-113425,
+# CVE-2026-123634 and other issues fixed in nginx 1.31.9. Rebuild OpenResty on
+# nginx 1.31.9 and replace the nginx binary. Remove this stage, the COPY below
+# and docker/scripts/{build-openresty-patched,bump-openresty-nginx.sh} once the
+# base image ships an OpenResty release based on nginx >= 1.31.9.
+FROM debian:trixie-slim AS openresty
+ARG OPENRESTY_VERSION=1.31.8.1
+ARG OPENRESTY_SHA256=71db26db9e39a20ac86f627da6e5005ded47ff63a66f10ff6f7b258218c5a418
+ARG NGINX_VERSION=1.31.9
+# sha256 of https://github.com/nginx/nginx/archive/refs/tags/release-${NGINX_VERSION}.tar.gz
+ARG NGINX_SHA256=5685eeba242229c0b4765216347374d4dfb76eef937317b8110535caea9ec8a6
+# Same ngx_http_geoip2_module revision the base image builds (its master branch)
+ARG GEOIP2_COMMIT=445df24ef3781e488cee3dfe8a1e111997fc1dfe
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends \
+	build-essential ca-certificates dos2unix git libmaxminddb-dev libpcre2-dev libssl-dev perl wget zlib1g-dev
+COPY docker/scripts/bump-openresty-nginx.sh /tmp/bump-openresty-nginx.sh
+COPY docker/scripts/build-openresty-patched /tmp/build-openresty-patched
+RUN /tmp/build-openresty-patched
+
 FROM $BASE_IMAGE
 
 ARG TARGETPLATFORM
@@ -40,6 +62,9 @@ EXPOSE 80 81 443
 COPY backend       /app
 COPY frontend/dist /app/frontend
 COPY docker/rootfs /
+# TEMPORARY: patched nginx binary, see the "openresty" stage above
+COPY --from=openresty /out/ /
+RUN nginx -V 2>&1 | head -n 1
 
 # Copy test CA cert for use in container and add to trusted certs from a self-signed CA
 COPY --from=testca /home/step/certs/root_ca.crt /etc/ssl/certs/NginxProxyManager.crt
